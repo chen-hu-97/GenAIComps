@@ -2,34 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import time
+from typing import Union
 
 from fastapi.responses import StreamingResponse
-from langchain_community.llms import VLLMOpenAI
+from huggingface_hub import AsyncInferenceClient
+from langchain_core.prompts import PromptTemplate
+from openai import OpenAI
+from template import ChatTemplate
 
 from comps import (
     CustomLogger,
     GeneratedDoc,
     LLMParamsDoc,
+    SearchedDoc,
     ServiceType,
     opea_microservices,
     opea_telemetry,
     register_microservice,
+    register_statistics,
+    statistics_dict,
 )
+from comps.cores.proto.api_protocol import ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamResponse
 
 logger = CustomLogger("llm_vllm")
 logflag = os.getenv("LOGFLAG", False)
 
-
-@opea_telemetry
-def post_process_text(text: str):
-    if text == " ":
-        return "data: @#$\n\n"
-    if text == "\n":
-        return "data: <br/>\n\n"
-    if text.isspace():
-        return None
-    new_text = text.replace(" ", "@#$")
-    return f"data: {new_text}\n\n"
 
 
 @register_microservice(
@@ -39,39 +37,220 @@ def post_process_text(text: str):
     host="0.0.0.0",
     port=9000,
 )
-def llm_generate(input: LLMParamsDoc):
-    if logflag:
-        logger.info(input)
+@register_statistics(names=["opea_service@llm_vllm"])
+async def llm_generate(input: Union[LLMParamsDoc, ChatCompletionRequest, SearchedDoc]):
     llm_endpoint = os.getenv("vLLM_ENDPOINT", "http://localhost:8008")
     model_name = os.getenv("LLM_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
-    llm = VLLMOpenAI(
-        openai_api_key="EMPTY",
-        openai_api_base=llm_endpoint + "/v1",
-        max_tokens=input.max_new_tokens,
-        model_name=model_name,
-        top_p=input.top_p,
-        temperature=input.temperature,
-        streaming=input.streaming,
-    )
+    if logflag:
+        logger.info(input)
+    prompt_template = None
+    if not isinstance(input, SearchedDoc) and input.chat_template:
+        prompt_template = PromptTemplate.from_template(input.chat_template)
+        input_variables = prompt_template.input_variables
 
-    if input.streaming:
+    stream_gen_time = []
+    start = time.time()
 
-        def stream_generator():
-            chat_response = ""
-            for text in llm.stream(input.query):
-                chat_response += text
-                chunk_repr = repr(text.encode("utf-8"))
-                yield f"data: {chunk_repr}\n\n"
-            if logflag:
-                logger.info(f"[llm - chat_stream] stream response: {chat_response}")
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    else:
-        response = llm.invoke(input.query)
+    if isinstance(input, SearchedDoc):
         if logflag:
-            logger.info(response)
-        return GeneratedDoc(text=response, prompt=input.query)
+            logger.info("[ SearchedDoc ] input from retriever microservice")
+        prompt = input.initial_query
+        if input.retrieved_docs:
+            if logflag:
+                logger.info(f"[ SearchedDoc ] retrieved docs: {input.retrieved_docs}")
+                for doc in input.retrieved_docs:
+                    logger.info(f"[ SearchedDoc ] {doc}")
+            prompt = ChatTemplate.generate_rag_prompt(input.initial_query, input.retrieved_docs[0].text)
+        # use default llm parameters for inferencing
+        new_input = LLMParamsDoc(query=prompt)
+        if logflag:
+            logger.info(f"[ SearchedDoc ] final input: {new_input}")
+        text_generation = await llm.text_generation(
+            prompt=prompt,
+            stream=new_input.streaming,
+            max_new_tokens=new_input.max_new_tokens,
+            repetition_penalty=new_input.repetition_penalty,
+            temperature=new_input.temperature,
+            top_k=new_input.top_k,
+            top_p=new_input.top_p,
+        )
+        if new_input.streaming:
+
+            async def stream_generator():
+                chat_response = ""
+                async for text in text_generation:
+                    stream_gen_time.append(time.time() - start)
+                    chat_response += text
+                    chunk_repr = repr(text.encode("utf-8"))
+                    if logflag:
+                        logger.info(f"[ SearchedDoc ] chunk:{chunk_repr}")
+                    yield f"data: {chunk_repr}\n\n"
+                if logflag:
+                    logger.info(f"[ SearchedDoc ] stream response: {chat_response}")
+                statistics_dict["opea_service@llm_tgi"].append_latency(stream_gen_time[-1], stream_gen_time[0])
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            statistics_dict["opea_service@llm_tgi"].append_latency(time.time() - start, None)
+            if logflag:
+                logger.info(text_generation)
+            return GeneratedDoc(text=text_generation, prompt=new_input.query)
+
+    elif isinstance(input, LLMParamsDoc):
+        if logflag:
+            logger.info("[ LLMParamsDoc ] input from rerank microservice")
+        prompt = input.query
+        if prompt_template:
+            if sorted(input_variables) == ["context", "question"]:
+                prompt = prompt_template.format(question=input.query, context="\n".join(input.documents))
+            elif input_variables == ["question"]:
+                prompt = prompt_template.format(question=input.query)
+            else:
+                logger.info(
+                    f"[ LLMParamsDoc ] {prompt_template} not used, we only support 2 input variables ['question', 'context']"
+                )
+        else:
+            if input.documents:
+                # use rag default template
+                prompt = ChatTemplate.generate_rag_prompt(input.query, input.documents)
+
+        client = OpenAI(
+            api_key="EMPTY",
+            base_url=llm_endpoint + "/v1",
+        )
+
+        messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+                #{"role": "user", "content": input.query}
+        ]
+        chat_completion = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            stream=input.streaming
+        )
+
+        if input.streaming:
+
+           def stream_generator():
+               chat_response = ""
+               for c in chat_completion:
+                   stream_gen_time.append(time.time() - start)
+                   if c.choices and c.choices[0].delta.content is not None:
+                       text = c.choices[0].delta.content
+                   else:
+                       text = ""
+                   chat_response += text
+                   chunk_repr = repr(text.encode("utf-8"))
+                   yield f"data: {chunk_repr}\n\n"
+               statistics_dict["opea_service@llm_vllm"].append_latency(stream_gen_time[-1], stream_gen_time[0])
+               yield "data: [DONE]\n\n"
+
+           return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            if logflag:
+                logger.info(chat_completion)
+            return chat_completion   
+    else:
+        if logflag:
+            logger.info("[ ChatCompletionRequest ] input in opea format")
+        client = OpenAI(
+            api_key="EMPTY",
+            base_url=llm_endpoint + "/v1",
+        )
+
+        if isinstance(input.messages, str):
+            prompt = input.messages
+            if prompt_template:
+                if sorted(input_variables) == ["context", "question"]:
+                    prompt = prompt_template.format(question=input.messages, context="\n".join(input.documents))
+                elif input_variables == ["question"]:
+                    prompt = prompt_template.format(question=input.messages)
+                else:
+                    logger.info(
+                        f"[ ChatCompletionRequest ] {prompt_template} not used, we only support 2 input variables ['question', 'context']"
+                    )
+            else:
+                if input.documents:
+                    # use rag default template
+                    prompt = ChatTemplate.generate_rag_prompt(input.messages, input.documents)
+
+            chat_completion = client.completions.create(
+                model=model_name,
+                prompt=prompt,
+                best_of=input.best_of,
+                echo=input.echo,
+                frequency_penalty=input.frequency_penalty,
+                logit_bias=input.logit_bias,
+                logprobs=input.logprobs,
+                max_tokens=input.max_tokens,
+                n=input.n,
+                presence_penalty=input.presence_penalty,
+                seed=input.seed,
+                stop=input.stop,
+                stream=input.stream,
+                suffix=input.suffix,
+                temperature=input.temperature,
+                top_p=input.top_p,
+                user=input.user,
+            )
+        else:
+            if input.messages[0]["role"] == "system":
+                if "{context}" in input.messages[0]["content"]:
+                    if input.documents is None or input.documents == []:
+                        input.messages[0]["content"].format(context="")
+                    else:
+                        input.messages[0]["content"].format(context="\n".join(input.documents))
+            else:
+                if prompt_template:
+                    system_prompt = prompt_template
+                    if input_variables == ["context"]:
+                        system_prompt = prompt_template.format(context="\n".join(input.documents))
+                    else:
+                        logger.info(
+                            f"[ ChatCompletionRequest ] {prompt_template} not used, only support 1 input variables ['context']"
+                        )
+
+                    input.messages.insert(0, {"role": "system", "content": system_prompt})
+
+            chat_completion = client.chat.completions.create(
+                model=model_name,
+                messages=input.messages,
+                frequency_penalty=input.frequency_penalty,
+                logit_bias=input.logit_bias,
+                logprobs=input.logprobs,
+                top_logprobs=input.top_logprobs,
+                max_tokens=input.max_tokens,
+                n=input.n,
+                presence_penalty=input.presence_penalty,
+                response_format=input.response_format,
+                seed=input.seed,
+                service_tier=input.service_tier,
+                stop=input.stop,
+                stream=input.stream,
+                stream_options=input.stream_options,
+                temperature=input.temperature,
+                tools=input.tools,
+                tool_choice=input.tool_choice,
+                parallel_tool_calls=input.parallel_tool_calls,
+                user=input.user,
+            )
+
+        if input.stream:
+
+            def stream_generator():
+                for c in chat_completion:
+                    if logflag:
+                        logger.info(c)
+                    yield f"data: {c.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            if logflag:
+                logger.info(chat_completion)
+            return chat_completion
 
 
 if __name__ == "__main__":
